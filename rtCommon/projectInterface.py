@@ -11,15 +11,16 @@ import toml
 import shlex
 import uuid
 import bcrypt
+import numbers
 import asyncio
 import threading
 import subprocess
 from pathlib import Path
-from rtCommon.webClientUtils import listFilesReqStruct, getFileReqStruct, decodeMessageData
-from rtCommon.webClientUtils import defaultWebPipeName, makeFifo, unpackDataMessage
+from rtCommon.projectUtils import listFilesReqStruct, getFileReqStruct, decodeMessageData
+from rtCommon.projectUtils import defaultPipeName, makeFifo, unpackDataMessage
 from rtCommon.structDict import StructDict, recurseCreateStructDict
 from rtCommon.certsUtils import getCertPath, getKeyPath
-from rtCommon.utils import DebugLevels, writeFile
+from rtCommon.utils import DebugLevels, writeFile, loadConfigFile
 from rtCommon.errors import StateError, RequestError, RTError
 
 certsDir = 'certs'
@@ -31,9 +32,6 @@ maxDaysLoginCookieValid = 0.5
 
 moduleDir = os.path.dirname(os.path.realpath(__file__))
 rootDir = os.path.dirname(moduleDir)
-confDir = os.path.join(moduleDir, 'conf/')
-if not os.path.exists(confDir):
-    os.makedirs(confDir)
 
 # Note: User refers to the clinician running the experiment, so userWindow is the main
 #  browser window for running the experiment.
@@ -54,7 +52,8 @@ class Web():
     browserBiofeedCallback = None
     eventCallback = None
     # Main html page to load
-    webDir = moduleDir
+    webDir = os.path.join(rootDir, 'web/')
+    confDir = os.path.join(webDir, 'conf/')
     htmlDir = os.path.join(webDir, 'html')
     webIndexPage = 'index.html'
     webLoginPage = 'login.html'
@@ -69,9 +68,13 @@ class Web():
     ioLoopInst = None
     filesremote = False
     fmriPyScript = None
+    initScript = None
+    finalizeScript = None
+    configFilename = None
     cfg = None
     testMode = False
     runInfo = StructDict({'threadId': None, 'stopRun': False})
+    resultVals = [[{'x': 0, 'y': 0}]]
 
     @staticmethod
     def start(params, cfg, testMode=False):
@@ -94,8 +97,15 @@ class Web():
         if params.port:
             Web.httpPort = params.port
         Web.fmriPyScript = params.fmriPyScript
+        Web.initScript = params.initScript
+        Web.finalizeScript = params.finalizeScript
         Web.filesremote = params.filesremote
+        if type(cfg) is str:
+            Web.configFilename = cfg
+            cfg = loadConfigFile(Web.configFilename)
         Web.cfg = cfg
+        if not os.path.exists(Web.confDir):
+            os.makedirs(Web.confDir)
         src_root = os.path.join(Web.webDir, 'src')
         css_root = os.path.join(Web.webDir, 'css')
         img_root = os.path.join(Web.webDir, 'img')
@@ -132,8 +142,8 @@ class Web():
             asyncio.set_event_loop(asyncio.new_event_loop())
 
         # start thread listening for remote file requests on a default named pipe
-        webpipes = makeFifo(pipename=defaultWebPipeName)
-        fifoThread = threading.Thread(name='defaultWebpipeThread', target=repeatWebPipeRequestHandler, args=(webpipes,))
+        commPipes = makeFifo(pipename=defaultPipeName)
+        fifoThread = threading.Thread(name='defaultPipeThread', target=repeatPipeRequestHandler, args=(commPipes,))
         fifoThread.setDaemon(True)
         fifoThread.start()
 
@@ -196,19 +206,29 @@ class Web():
         Web.sendUserMsgFromThread(json.dumps(cmd))
 
     @staticmethod
+    def sessionLog(logStr):
+        cmd = {'cmd': 'sessionLog', 'value': logStr}
+        Web.sendUserMsgFromThread(json.dumps(cmd))
+
+    @staticmethod
     def setUserError(errStr):
         response = {'cmd': 'error', 'error': errStr}
         Web.sendUserMsgFromThread(json.dumps(response))
 
     @staticmethod
-    def sendUserConfig(config, filesremote=True):
-        response = {'cmd': 'config', 'value': config, 'filesremote': filesremote}
+    def sendUserConfig(config, filename=''):
+        response = {'cmd': 'config', 'value': config, 'filename': filename}
+        Web.sendUserMsgFromThread(json.dumps(response))
+
+    @staticmethod
+    def sendUserDataVals(dataPoints):
+        response = {'cmd': 'dataPoints', 'value': dataPoints}
         Web.sendUserMsgFromThread(json.dumps(response))
 
     @staticmethod
     def sendDataMsgFromThreadAsync(msg):
         if Web.wsDataConn is None:
-            raise StateError("WebServer: No Data Websocket Connection")
+            raise StateError("ProjectInterface: FileServer not connected. Please run the fileServer.")
         callId = msg.get('callId')
         if not callId:
             callbackStruct = StructDict()
@@ -306,7 +326,7 @@ class Web():
         try:
             callbackStruct = Web.dataCallbacks.get(callId, None)
             if callbackStruct is None:
-                logging.error('WebServer: dataCallback callId {} not found, current callId {}'
+                logging.error('ProjectInterface: dataCallback callId {} not found, current callId {}'
                               .format(callId, Web.dataSequenceNum))
                 return
             if callbackStruct.callId != callId:
@@ -316,7 +336,7 @@ class Web():
             callbackStruct.numResponses += 1
             callbackStruct.semaphore.release()
         except Exception as err:
-            logging.error('WebServer: dataCallback error: {}'.format(err))
+            logging.error('ProjectInterface: dataCallback error: {}'.format(err))
             raise err
         finally:
             Web.callbackLock.release()
@@ -376,6 +396,33 @@ class Web():
                 client.write_message(msg)
         finally:
             Web.wsConnLock.release()
+
+    @staticmethod
+    def addResultValue(request):
+        cmd = request.get('cmd')
+        if cmd != 'resultValue':
+            logging.warn('addResultValue: wrong cmd type {}'.format(cmd))
+            return
+        runId = request.get('runId')
+        x = request.get('trId')
+        y = request.get('value')
+        if not isinstance(runId, numbers.Number) or runId <= 0:
+            logging.warn('addResultValue: runId wrong val {}'.format(cmd))
+            return
+        # Make sure resultVals has at least as many arrays as runIds
+        for i in range(len(Web.resultVals), runId):
+            Web.resultVals.append([])
+        if not isinstance(x, numbers.Number):
+            # clear plot for this runId
+            Web.resultVals[runId-1] = []
+            return
+        # logging.info("Add resultVal {}, {}".format(x, y))
+        runVals = Web.resultVals[runId-1]
+        for i, val in enumerate(runVals):
+            if val['x'] == x:
+                runVals[i] = {'x': x, 'y': y}
+                return
+        runVals.append({'x': x, 'y': y})
 
     class UserHttp(tornado.web.RequestHandler):
         def get_current_user(self):
@@ -602,7 +649,7 @@ class Web():
                 if prevDataConn is not None:
                     prevDataConn.close()
             except Exception as err:
-                logging.error('WebServer: Open Data Socket error: {}'.format(err))
+                logging.error('ProjectInterface: Open Data Socket error: {}'.format(err))
             finally:
                 Web.wsConnLock.release()
             print('DataWebSocket: connected {}'.format(self.request.remote_ip))
@@ -694,8 +741,16 @@ def defaultBrowserMainCallback(client, message):
     logging.log(DebugLevels.L3, "WEB USER CMD: %s", cmd)
     if cmd == "getDefaultConfig":
         # TODO - may need to remove certain fields that can't be jsonified
-        Web.sendUserConfig(Web.cfg, filesremote=Web.filesremote)
-    elif cmd == "run":
+        if Web.configFilename is not None and Web.configFilename != '':
+            cfg = loadConfigFile(Web.configFilename)
+        else:
+            cfg = Web.cfg
+        Web.sendUserConfig(cfg, filename=Web.configFilename)
+    elif cmd == "getDataPoints":
+        Web.sendUserDataVals(Web.resultVals)
+    elif cmd == "clearDataPoints":
+        Web.resultVals = [[{'x': 0, 'y': 0}]]
+    elif cmd == "run" or cmd == "initSession" or cmd == "finalizeSession":
         if Web.runInfo.threadId is not None:
             Web.runInfo.threadId.join(timeout=1)
             if Web.runInfo.threadId.is_alive():
@@ -703,8 +758,24 @@ def defaultBrowserMainCallback(client, message):
                 return
             Web.runInfo.threadId = None
         Web.runInfo.stopRun = False
-        Web.runInfo.threadId = threading.Thread(name='runSessionThread', target=runSession,
-                                                args=(Web.cfg, Web.fmriPyScript, Web.filesremote))
+        if cmd == 'run':
+            sessionScript = Web.fmriPyScript
+            tag = 'running'
+            logType = 'run'
+        elif cmd == 'initSession':
+            sessionScript = Web.initScript
+            tag = 'initializing'
+            logType = 'prep'
+        elif cmd == "finalizeSession":
+            sessionScript = Web.finalizeScript
+            tag = 'finalizing'
+            logType = 'prep'
+        if sessionScript is None or sessionScript == '':
+            Web.setUserError("{} script not set".format(cmd))
+            return
+        Web.runInfo.threadId = threading.Thread(name='sessionThread', target=runSession,
+                                                args=(Web.cfg, sessionScript,
+                                                      Web.filesremote, tag, logType))
         Web.runInfo.threadId.setDaemon(True)
         Web.runInfo.threadId.start()
     elif cmd == "stop":
@@ -743,12 +814,14 @@ def defaultEventCallback(client, message):
     print('Event Callback: {}'.format(cmd))
 
 
-def runSession(cfg, pyScript, filesremote=False):
+def runSession(cfg, pyScript, filesremote, tag, logType='run'):
     # write out config file for use by pyScript
-    configFileName = os.path.join(confDir, 'cfg_{}_day{}_run{}.toml'.
-                                  format(cfg.subjectName,
-                                         cfg.subjectDay,
-                                         cfg.runNum[0]))
+    if logType == 'run':
+        configFileName = os.path.join(Web.confDir, 'cfg_sub{}_day{}_run{}.toml'.
+                                      format(cfg.subjectName, cfg.subjectDay, cfg.runNum[0]))
+    else:
+        configFileName = os.path.join(Web.confDir, 'cfg_sub{}_day{}_{}.toml'.
+                                      format(cfg.subjectName, cfg.subjectDay, tag))
     with open(configFileName, 'w+') as fd:
         toml.dump(cfg, fd)
 
@@ -757,12 +830,12 @@ def runSession(cfg, pyScript, filesremote=False):
     # set option for remote file requests
     if filesremote is True:
         cmdStr += ' -x'
-    # Create a webpipe session even if using local files so we can send
+    # Create a project commPipe even if using local files so we can send
     #  classification results to the subject feedback window
-    webpipes = makeFifo()
-    cmdStr += ' --webpipe {}'.format(webpipes.fifoname)
+    commPipes = makeFifo()
+    cmdStr += ' --commpipe {}'.format(commPipes.fifoname)
     # start thread listening for remote file requests on fifo queue
-    fifoThread = threading.Thread(name='fifoThread', target=webPipeRequestHandler, args=(webpipes,))
+    fifoThread = threading.Thread(name='fifoThread', target=commPipeRequestHandler, args=(commPipes,))
     fifoThread.setDaemon(True)
     fifoThread.start()
     # print(cmdStr)
@@ -770,7 +843,7 @@ def runSession(cfg, pyScript, filesremote=False):
     proc = subprocess.Popen(cmd, cwd=rootDir, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, stdin=subprocess.PIPE)
     # send running status to user web page
-    response = {'cmd': 'runStatus', 'status': 'running'}
+    response = {'cmd': 'runStatus', 'status': tag}
     Web.sendUserMsgFromThread(json.dumps(response))
     # start a separate thread to read the process output
     lineQueue = queue.Queue()
@@ -788,10 +861,13 @@ def runSession(cfg, pyScript, filesremote=False):
         except queue.Empty:
             line = ''
         if line != '':
-            Web.userLog(line)
+            if logType == 'run':
+                Web.userLog(line)
+            else:
+                Web.sessionLog(line)
             logging.info(line.rstrip())
     # processing complete, set status
-    endStatus = 'complete \u2714'
+    endStatus = tag + ' complete \u2714'
     if Web.runInfo.stopRun is True:
         endStatus = 'stopped'
     response = {'cmd': 'runStatus', 'status': endStatus}
@@ -801,7 +877,7 @@ def runSession(cfg, pyScript, filesremote=False):
         print("OutputThread failed to exit")
     # make sure fifo thread has exited
     if fifoThread is not None:
-        signalFifoExit(fifoThread, webpipes)
+        signalFifoExit(fifoThread, commPipes)
     return
 
 
@@ -817,22 +893,22 @@ def procOutputReader(proc, lineQueue):
             break
 
 
-def repeatWebPipeRequestHandler(webpipes):
+def repeatPipeRequestHandler(commPipes):
     while True:
-        webPipeRequestHandler(webpipes)
+        commPipeRequestHandler(commPipes)
 
 
-def webPipeRequestHandler(webpipes):
+def commPipeRequestHandler(commPipes):
     '''A thread routine that listens for requests from a process through a pair of named pipes.
-    This allows another process to send web requests without directly integrating
-    the web server into the process.
+    This allows another process to send project requests without directly integrating
+    the projectInterface into the process.
     Listens on an fd_in pipe for requests and writes the results back on the fd_out pipe.
     '''
-    webpipes.fd_out = open(webpipes.name_out, mode='w', buffering=1)
-    webpipes.fd_in = open(webpipes.name_in, mode='r')
+    commPipes.fd_out = open(commPipes.name_out, mode='w', buffering=1)
+    commPipes.fd_in = open(commPipes.name_in, mode='r')
     try:
         while True:
-            msg = webpipes.fd_in.readline()
+            msg = commPipes.fd_in.readline()
             if len(msg) == 0:
                 # fifo closed
                 break
@@ -840,15 +916,15 @@ def webPipeRequestHandler(webpipes):
             cmd = json.loads(msg)
             response = processPyScriptRequest(cmd)
             try:
-                webpipes.fd_out.write(json.dumps(response) + os.linesep)
+                commPipes.fd_out.write(json.dumps(response) + os.linesep)
             except BrokenPipeError:
                 print('handleFifoRequests: pipe broken')
                 break
         # End while loop
     finally:
         logging.info('handleFifo thread exit')
-        webpipes.fd_in.close()
-        webpipes.fd_out.close()
+        commPipes.fd_in.close()
+        commPipes.fd_out.close()
 
 
 def processPyScriptRequest(request):
@@ -885,6 +961,8 @@ def processPyScriptRequest(request):
                 Web.sendBiofeedbackMsgFromThread(json.dumps(request))
                 # forward to main browser window
                 Web.sendUserMsgFromThread(json.dumps(request))
+                # Accumulate results locally to resend to browser as needed
+                Web.addResultValue(request)
             except Exception as err:
                 errStr = 'SendClassification Exception type {}: error {}:'.format(type(err), str(err))
                 response = {'status': 400, 'error': errStr}
@@ -892,11 +970,11 @@ def processPyScriptRequest(request):
                 logging.error('handleFifo Excpetion: {}'.format(errStr))
                 raise err
         elif cmd == 'subjectDisplay':
-            logging.info('subjectDisplay webServerCallback')
+            logging.info('subjectDisplay projectInterface Callback')
     return response
 
 
-def signalFifoExit(fifoThread, webpipes):
+def signalFifoExit(fifoThread, commPipes):
     '''Under normal exit conditions the fifothread will exit when the fifo filehandles
     are closed. However if the fifo filehandles were never opened by both ends then
     the fifothread can be blocked waiting for them to open. To handle that case
@@ -907,11 +985,11 @@ def signalFifoExit(fifoThread, webpipes):
     if fifoThread is None:
         return
     try:
-        pipeout = os.open(webpipes.name_out, os.O_RDONLY | os.O_NONBLOCK)
+        pipeout = os.open(commPipes.name_out, os.O_RDONLY | os.O_NONBLOCK)
         os.close(pipeout)
         # trigger context swap to allow handleFifoRequests to open next pipe if needed
         time.sleep(0.1)
-        pipein = os.open(webpipes.name_in, os.O_WRONLY | os.O_NONBLOCK)
+        pipein = os.open(commPipes.name_in, os.O_WRONLY | os.O_NONBLOCK)
         os.close(pipein)
     except OSError as err:
         # No reader/writer listening on file so fifoThread already exited
@@ -963,7 +1041,7 @@ def uploadFiles(request):
         Web.setUserError("Error listing files {}: {}".
                          format(srcFile, response.get('error')))
         return
-    fileList = response.get('data')
+    fileList = response.get('fileList')
     if type(fileList) is not list:
         Web.setUserError("Invalid fileList reponse type {}: expecting list".
                          format(type(fileList)))

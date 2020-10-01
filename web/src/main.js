@@ -6,6 +6,7 @@ const SettingsPane = require('./settingsPane.js')
 const StatusPane = require('./statusPane.js')
 const XYPlotPane = require('./xyplotPane.js')
 const UploadFilesPane = require('./uploadFilesPane.js')
+const SessionPane = require('./sessionPane.js')
 const { Tab, Tabs, TabList, TabPanel } = require('react-tabs')
 
 const elem = React.createElement;
@@ -16,6 +17,17 @@ const logLineStyle = {
 
 // This will be updated based on the value in the config file
 var projectTitle = 'Real-Time Study';
+
+function arrayCompareXValue(a, b){
+  if (a['x'] > b['x']) return 1;
+  if (b['x'] > a['x']) return -1;
+  return 0;
+}
+
+function arrayFindIndexByX(arr, xval){
+    var idx = arr.findIndex(function(element){return element['x']==xval})
+    return idx
+}
 
 class TopPane extends React.Component {
   constructor(props) {
@@ -34,20 +46,24 @@ class TopPane extends React.Component {
       plotVals: [[{x:0, y:0}], []], // results to plot
       logLines: [],
       uploadedFileLog: [],
+      sessionLog: [],
     }
-    this.resultVals = [[], []]
+    this.resultVals = [[], []] // mutable version of plotVals to accumulate changes
     this.webSocket = null
     this.setConfigFileName = this.setConfigFileName.bind(this);
     this.setConfig = this.setConfig.bind(this);
     this.getConfigItem = this.getConfigItem.bind(this);
     this.setConfigItem = this.setConfigItem.bind(this);
     this.requestDefaultConfig = this.requestDefaultConfig.bind(this)
+    this.requestDataPoints = this.requestDataPoints.bind(this)
     this.startRun = this.startRun.bind(this);
     this.stopRun = this.stopRun.bind(this);
     this.uploadFiles = this.uploadFiles.bind(this);
+    this.runSession = this.runSession.bind(this);
     this.createWebSocket = this.createWebSocket.bind(this)
     this.formatConfigValues = this.formatConfigValues.bind(this)
     this.clearRunStatus = this.clearRunStatus.bind(this)
+    this.clearPlots = this.clearPlots.bind(this)
     this.createWebSocket()
   }
 
@@ -92,6 +108,26 @@ class TopPane extends React.Component {
     this.webSocket.send(cmdStr)
   }
 
+  requestDataPoints() {
+    var cmd = {cmd: 'getDataPoints'}
+    var cmdStr = JSON.stringify(cmd)
+    this.webSocket.send(cmdStr)
+  }
+
+  clearPlots() {
+    // clear plots remote data
+    var cmd = {cmd: 'clearDataPoints'}
+    var cmdStr = JSON.stringify(cmd)
+    this.webSocket.send(cmdStr)
+    // clear plots local data
+    for (let i = 0; i < this.resultVals.length; i++) {
+      this.resultVals[i] = []
+    }
+    // Set a zero value so and empty plot appears
+    this.resultVals[0] = [{x:0, y:0}]
+    this.setState({plotVals: this.resultVals})
+  }
+
   startRun() {
     // clear previous log output
     this.setState({logLines: []})
@@ -115,6 +151,19 @@ class TopPane extends React.Component {
                   compress: compress,
                  }
     this.webSocket.send(JSON.stringify(cmdStr))
+  }
+
+  runSession(cmd) {
+    // clear previous log output
+    var firstLogMsg = '##### ' + cmd + ' #####'
+    this.setState({sessionLog: [firstLogMsg]})
+    this.setState({error: ''})
+
+    var cfg = this.formatConfigValues(this.state.config)
+    if (cfg == null) {
+        return
+    }
+    this.webSocket.send(JSON.stringify({cmd: cmd}))
   }
 
   formatConfigValues(cfg) {
@@ -201,6 +250,7 @@ class TopPane extends React.Component {
       this.setState({connected: true})
       console.log("WebSocket OPEN: ");
       this.requestDefaultConfig();
+      this.requestDataPoints();
     };
     webSocket.onclose = (closeEvent) => {
       this.setState({connected: false})
@@ -218,7 +268,9 @@ class TopPane extends React.Component {
       var cmd = request['cmd']
       if (cmd == 'config') {
         var config = request['value']
+        var filename = request['filename']
         this.setConfig(config)
+        this.setConfigFileName(filename)
       } else if (cmd == 'userLog') {
         var logItem = request['value'].trim()
         var itemPos = this.state.logLines.length + 1
@@ -226,6 +278,13 @@ class TopPane extends React.Component {
         // Need to use concat() to create a new logLines object or React won't know to re-render
         var logLines = this.state.logLines.concat([newLine])
         this.setState({logLines: logLines})
+      } else if (cmd == 'sessionLog') {
+        var logItem = request['value'].trim()
+        var itemPos = this.state.sessionLog.length + 1
+        var newLine = elem('pre', { style: logLineStyle,  key: itemPos }, logItem)
+        // Need to use concat() to create a new logLines object or React won't know to re-render
+        var sessionLog = this.state.sessionLog.concat([newLine])
+        this.setState({sessionLog: sessionLog})
       } else if (cmd == 'runStatus') {
         var status = request['status']
         if (status == undefined || status.length == 0) {
@@ -248,21 +307,39 @@ class TopPane extends React.Component {
           this.resultVals.push([])
         }
         // clear plots with runId greater than the current one
-        for (let i = runId; i < this.resultVals.length; i++) {
-          this.resultVals[i] = []
-        }
+        // for (let i = runId; i < this.resultVals.length; i++) {
+        //   this.resultVals[i] = []
+        // }
         // console.log(`resultValue: ${resultVal} ${vol} ${runId}`)
         if (typeof(vol) == 'number') {
           // ResultVals is zero-based and runId is 1-based, so resultVal index will be runId-1
-          // add new data point to resultVals for this runId
           var runResultVals = this.resultVals[runId-1]
-          var itemPos = runResultVals.length + 1
-          runResultVals.push({x: itemPos, y: resultVal})
+          // see if there is already a plot point for this vol (x-value)
+          var idx = arrayFindIndexByX(runResultVals, vol)
+          if (idx >= 0) {
+            // overwrite the existing point
+            runResultVals[idx] = {x: vol, y: resultVal}
+          } else {
+            // add new data point to resultVals for this runId
+            runResultVals.push({x: vol, y: resultVal})
+          }
+          runResultVals.sort(arrayCompareXValue)
         } else {
           // vol is not a number, clear the resultVals for this run
           this.resultVals[runId-1] = []
         }
         this.setState({plotVals: this.resultVals})
+      } else if (cmd == 'dataPoints') {
+        var dataPoints = request['value']
+        if (Array.isArray(dataPoints)) {
+          this.resultVals = []
+          for (let i = 0; i < dataPoints.length; i++) {
+              var runVals = dataPoints[i]
+              runVals.sort(arrayCompareXValue)
+              this.resultVals.push(runVals)
+          }
+          this.setState({plotVals: this.resultVals})
+        }
       } else if (cmd == 'error') {
         console.log("## Got Error: " + request['error'])
         this.setState({error: request['error']})
@@ -281,8 +358,9 @@ class TopPane extends React.Component {
        elem(TabList, {},
          elem(Tab, {}, 'Run'),
          elem(Tab, {}, 'Data Plots'),
+         elem(Tab, {}, 'Session'),
          elem(Tab, {}, 'Settings'),
-         elem(Tab, {}, 'Upload Files'),
+         // elem(Tab, {}, 'Upload Files'),
        ),
        elem(TabPanel, {},
          elem(StatusPane,
@@ -304,6 +382,18 @@ class TopPane extends React.Component {
          elem(XYPlotPane,
            {config: this.state.config,
             plotVals: this.state.plotVals,
+            clearPlots: this.clearPlots,
+           }
+         ),
+       ),
+       elem(TabPanel, {},
+         elem(SessionPane,
+           {runSession: this.runSession,
+            stopRun: this.stopRun,
+            sessionLog: this.state.sessionLog,
+            connected: this.state.connected,
+            runStatus: this.state.runStatus,
+            error: this.state.error,
            }
          ),
        ),
@@ -315,17 +405,18 @@ class TopPane extends React.Component {
             getConfigItem: this.getConfigItem,
             setConfigItem: this.setConfigItem,
             setConfigFileName: this.setConfigFileName,
+            requestDefaultConfig: this.requestDefaultConfig,
            }
          ),
        ),
-       elem(TabPanel, {},
-         elem(UploadFilesPane,
-           {uploadFiles: this.uploadFiles,
-            uploadedFileLog: this.state.uploadedFileLog,
-            error: this.state.error,
-           }
-         ),
-       ),
+       // elem(TabPanel, {},
+       //   elem(UploadFilesPane,
+       //     {uploadFiles: this.uploadFiles,
+       //      uploadedFileLog: this.state.uploadedFileLog,
+       //      error: this.state.error,
+       //     }
+       //   ),
+       // ),
      )
     return tp
   }

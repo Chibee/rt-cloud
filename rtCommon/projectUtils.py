@@ -4,6 +4,8 @@ import re
 import json
 import time
 import zlib
+import glob
+import shutil
 import hashlib
 import logging
 import getpass
@@ -13,28 +15,28 @@ from pathlib import Path
 from base64 import b64encode, b64decode
 import rtCommon.utils as utils
 from rtCommon.structDict import StructDict
-from rtCommon.readDicom import readDicomFromBuffer
+from rtCommon.imageHandling import readDicomFromBuffer
 from rtCommon.errors import RequestError, StateError, ValidationError
 from requests.packages.urllib3.contrib import pyopenssl
 
 certFile = 'certs/rtcloud.crt'
-defaultWebPipeName = 'rt_webpipe_default'
+defaultPipeName = 'rt_pipe_default'
 
 # Cache of multi-part data transfers in progress
 multiPartDataCache = {}
 dataPartSize = 10 * (2**20)
 
 
-def openWebServerConnection(pipeName):
+def openNamedPipe(pipeName):
     '''
-    Open a named pipe connection to the local webserver. Open the in and out named pipes.
+    Open a named pipe connection to the local projectInterface. Open the in and out named pipes.
     Pipe.Open() blocks until the other end opens it as well. Therefore open the reader first
-    here and the writer first within the webserver.
+    here and the writer first within the projectInterface.
     '''
-    webpipes = makeFifo(pipename=pipeName, isServer=False)
-    webpipes.fd_in = open(webpipes.name_in, mode='r')
-    webpipes.fd_out = open(webpipes.name_out, mode='w', buffering=1)
-    return webpipes
+    commPipes = makeFifo(pipename=pipeName, isServer=False)
+    commPipes.fd_in = open(commPipes.name_in, mode='r')
+    commPipes.fd_out = open(commPipes.name_out, mode='w', buffering=1)
+    return commPipes
 
 
 def watchForExit():
@@ -53,7 +55,7 @@ def processShouldExitThread():
     stdin we can tell that the parent process exited when stdin is closed. When
     stdin is closed we can exit this process as well.
     '''
-    print('processShouldExitThread: starting', flush=True)
+    # print('processShouldExitThread: starting', flush=True)
     while True:
         # logging.info('process should exit loop')
         data = sys.stdin.read()
@@ -83,6 +85,11 @@ def getNewestFileReqStruct(filename, compress=False):
 
 def listFilesReqStruct(filePattern):
     cmd = {'cmd': 'listFiles', 'route': 'dataserver', 'filename': filePattern}
+    return cmd
+
+
+def allowedFileTypesReqStruct():
+    cmd = {'cmd': 'getAllowedFileTypes', 'route': 'dataserver'}
     return cmd
 
 
@@ -136,71 +143,176 @@ def resultStruct(runId, trId, value):
     return cmd
 
 
-def initWebPipeConnection(webPipeName, filesRemote):
-    webComm = None
-    if webPipeName:
-        # Process is being run from a webserver
+def initProjectComm(commPipeName, filesRemote):
+    projComm = None
+    if commPipeName:
+        # Process is being run from a projectInterface
         # Watch for parent process exiting and then exit when it does
         watchForExit()
-    # If filesremote is true, must create a webpipe connecton to the webserver to retrieve the files
-    # If filesremote is false, but runing from a webserver, still need a webpipe connection to return logging output
-    # Only when local files and not run from a webserver is no webpipe connection needed
+    # If filesremote is true, must create a projComm connecton to the projectInterface to retrieve the files
+    # If filesremote is false, but runing from a projectInterface, still need a projComm connection to return logging output
+    # Only when local files is specified and script is not run from a projectInterface is no projComm connection needed
     if filesRemote:
-        # Must have a webpipe for remote files
-        if webPipeName is None:
-            # No webpipe name specified, use default name
-            webPipeName = defaultWebPipeName
-    if webPipeName:
-        webComm = openWebServerConnection(webPipeName)
-    return webComm
+        # Must have a projComm for remote files
+        if commPipeName is None:
+            # No pipe name specified, use default name
+            commPipeName = defaultPipeName
+    if commPipeName:
+        projComm = openNamedPipe(commPipeName)
+    return projComm
 
 
-def sendResultToWeb(webpipes, runId, trId, value):
-    if webpipes is not None:
+def sendResultToWeb(commPipes, runId, trId, value):
+    if commPipes is not None:
         cmd = resultStruct(runId, trId, value)
-        clientWebpipeCmd(webpipes, cmd)
+        clientSendCmd(commPipes, cmd)
 
 
-def clientWebpipeCmd(webpipes, cmd):
-    '''Send a web request using named pipes to the web server for handling.
-    This allows a separate client process to make requests of the web server process.
+def uploadFolderToCloud(fileInterface, srcDir, outputDir):
+    allowedFileTypes = fileInterface.allowedFileTypes()
+    logging.info('Uploading folder {} to cloud'.format(srcDir))
+    logging.info('UploadFolder limited to file types: {}'.format(allowedFileTypes))
+    dirPattern = os.path.join(srcDir, '**')  # ** wildcard means include sub-directories
+    fileList = fileInterface.listFiles(dirPattern)
+    # The src prefix is the part of the path to eliminate in the destination path
+    # This will be everything except the last subdirectory in srcDir
+    srcPrefix = os.path.dirname(srcDir)
+    uploadFilesFromList(fileInterface, fileList, outputDir, srcDirPrefix=srcPrefix)
+
+
+def uploadFilesToCloud(fileInterface, srcFilePattern, outputDir):
+    # get the list of files to upload
+    fileList = fileInterface.listFiles(srcFilePattern)
+    uploadFilesFromList(fileInterface, fileList, outputDir)
+
+
+def uploadFilesFromList(fileInterface, fileList, outputDir, srcDirPrefix=None):
+    for file in fileList:
+        fileDir, filename = os.path.split(file)
+        if srcDirPrefix is not None and fileDir.startswith(srcDirPrefix):
+            # Get just the part of fileDir after the srcDirPrefix
+            subDir = fileDir.replace(srcDirPrefix, '')
+        else:
+            subDir = ''
+        try:
+            data = fileInterface.getFile(file)
+        except Exception as err:
+            if type(err) is IsADirectoryError or 'IsADirectoryError' in str(err):
+                continue
+            raise(err)
+        outputFilename = os.path.normpath(outputDir + '/' + subDir + '/' + filename)
+        logging.info('upload: {} --> {}'.format(file, outputFilename))
+        utils.writeFile(outputFilename, data)
+
+
+def downloadFolderFromCloud(fileInterface, srcDir, outputDir, deleteAfter=False):
+    allowedFileTypes = fileInterface.allowedFileTypes()
+    logging.info('Downloading folder {} from the cloud'.format(srcDir))
+    logging.info('DownloadFolder limited to file types: {}'.format(allowedFileTypes))
+    dirPattern = os.path.join(srcDir, '**')
+    fileList = [x for x in glob.iglob(dirPattern, recursive=True)]
+    filteredList = []
+    for filename in fileList:
+        fileExtension = Path(filename).suffix
+        if fileExtension in allowedFileTypes or '*' in allowedFileTypes:
+            filteredList.append(filename)
+    # The src prefix is the part of the path to eliminate in the destination path
+    # This will be everything except the last subdirectory in srcDir
+    srcPrefix = os.path.dirname(srcDir)
+    downloadFilesFromList(fileInterface, filteredList, outputDir, srcDirPrefix=srcPrefix)
+    if deleteAfter:
+        deleteFilesFromList(filteredList)
+
+
+def downloadFilesFromCloud(fileInterface, srcFilePattern, outputDir, deleteAfter=False):
+    fileList = [x for x in glob.iglob(srcFilePattern)]
+    downloadFilesFromList(fileInterface, fileList, outputDir)
+    if deleteAfter:
+        deleteFilesFromList(fileList)
+
+
+def downloadFilesFromList(fileInterface, fileList, outputDir, srcDirPrefix=None):
+    for file in fileList:
+        if os.path.isdir(file):
+            continue
+        with open(file, 'rb') as fp:
+            data = fp.read()
+        fileDir, filename = os.path.split(file)
+        if srcDirPrefix is not None and fileDir.startswith(srcDirPrefix):
+            # Get just the part of fileDir after the srcDirPrefix
+            subDir = fileDir.replace(srcDirPrefix, '')
+        else:
+            subDir = ''
+        outputFilename = os.path.normpath(outputDir + '/' + subDir + '/' + filename)
+        logging.info('download: {} --> {}'.format(file, outputFilename))
+        fileInterface.putBinaryFile(outputFilename, data)
+    return
+
+
+def deleteFilesFromList(fileList):
+    for filename in fileList:
+        os.remove(filename)
+
+
+def deleteFolder(dir):
+    shutil.rmtree(dir)
+
+
+# Function to delete all files but leave the directory structure intact
+def deleteFolderFiles(dir, recursive=True):
+    dirPattern = os.path.join(dir, '**')
+    fileList = [x for x in glob.iglob(dirPattern, recursive=recursive)]
+    filteredList = []
+    for filename in fileList:
+        if not os.path.isdir(filename):
+            filteredList.append(filename)
+    deleteFilesFromList(filteredList)
+
+
+def clientSendCmd(commPipes, cmd):
+    '''Send a request using named pipes to the projectInterface for handling.
+    This allows a separate client process to make requests of the projectInterface process.
     It writes the request on fd_out and recieves the reply on fd_in.
     '''
     data = None
     savedError = None
     incomplete = True
     while incomplete:
-        webpipes.fd_out.write(json.dumps(cmd) + os.linesep)
-        msg = webpipes.fd_in.readline()
+        commPipes.fd_out.write(json.dumps(cmd) + os.linesep)
+        msg = commPipes.fd_in.readline()
         if len(msg) == 0:
             # fifo closed
-            raise StateError('WebPipe closed')
+            raise StateError('commPipe closed')
         response = json.loads(msg)
         status = response.get('status', -1)
         if status != 200:
-            raise RequestError('clientWebpipeCmd: Cmd: {} status {}: error {}'.
+            raise RequestError('clientSendCmd: Cmd: {} status {}: error {}'.
                                format(cmd.get('cmd'), status, response.get('error')))
         if 'data' in response:
             try:
                 data = unpackDataMessage(response)
             except Exception as err:
                 # The call may be incomplete, save the error and keep receiving as needed
-                logging.error('clientWebpipeCmd: {}'.format(err))
+                logging.error('clientSendCmd: {}'.format(err))
                 if savedError is None:
                     savedError = err
             cmd['callId'] = response.get('callId', -1)
         # Check if need to continue to get more parts
         incomplete = response.get('incomplete', False)
     if savedError:
-        raise RequestError('clientWebpipeCmd: {}'.format(savedError))
+        raise RequestError('clientSendCmd: {}'.format(savedError))
     retVals = StructDict()
     retVals.statusCode = response.get('status', -1)
     if 'filename' in response:
         retVals.filename = response['filename']
+    if 'fileList' in response:
+        retVals.fileList = response['fileList']
+    if 'fileTypes' in response:
+        retVals.fileTypes = response['fileTypes']
     if data:
         retVals.data = data
         if retVals.filename is None:
-            raise StateError('clientWebpipeCmd: filename field is None')
+            raise StateError('clientSendCmd: filename field is None')
     return retVals
 
 
@@ -407,25 +519,25 @@ def makeFifo(pipename=None, isServer=True):
         os.makedirs(fifodir)
     # create new pipe
     if pipename is None:
-        fifoname = os.path.join(fifodir, 'web_pipe_{}'.format(int(time.time())))
+        fifoname = os.path.join(fifodir, 'comm_pipe_{}'.format(int(time.time())))
         if isServer:
             # remove previous temporary named pipes
-            for p in Path(fifodir).glob("web_pipe_*"):
+            for p in Path(fifodir).glob("comm_pipe_*"):
                 p.unlink()
     else:
         fifoname = os.path.join(fifodir, pipename)
     # fifo stuct
-    webpipes = StructDict()
+    commPipes = StructDict()
     if isServer:
-        webpipes.name_out = fifoname + '.toclient'
-        webpipes.name_in = fifoname + '.fromclient'
+        commPipes.name_out = fifoname + '.toclient'
+        commPipes.name_in = fifoname + '.fromclient'
     else:
-        webpipes.name_out = fifoname + '.fromclient'
-        webpipes.name_in = fifoname + '.toclient'
+        commPipes.name_out = fifoname + '.fromclient'
+        commPipes.name_in = fifoname + '.toclient'
 
-    if not os.path.exists(webpipes.name_out):
-        os.mkfifo(webpipes.name_out)
-    if not os.path.exists(webpipes.name_in):
-        os.mkfifo(webpipes.name_in)
-    webpipes.fifoname = fifoname
-    return webpipes
+    if not os.path.exists(commPipes.name_out):
+        os.mkfifo(commPipes.name_out)
+    if not os.path.exists(commPipes.name_in):
+        os.mkfifo(commPipes.name_in)
+    commPipes.fifoname = fifoname
+    return commPipes

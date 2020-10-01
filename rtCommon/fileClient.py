@@ -1,14 +1,15 @@
 import os
+import glob
 from rtCommon.fileWatcher import FileWatcher
 from rtCommon.utils import findNewestFile
-import rtCommon.webClientUtils as wcutils
-from rtCommon.errors import StateError
+import rtCommon.projectUtils as projUtils
+from rtCommon.errors import StateError, RequestError
 
 
 class FileInterface:
-    def __init__(self, filesremote=False, webpipes=None):
+    def __init__(self, filesremote=False, commPipes=None):
         self.local = not filesremote
-        self.webpipes = webpipes
+        self.commPipes = commPipes
         self.fileWatcher = None
         self.initWatchSet = False
         if self.local:
@@ -25,8 +26,8 @@ class FileInterface:
             with open(filename, 'rb') as fp:
                 data = fp.read()
         else:
-            getFileCmd = wcutils.getFileReqStruct(filename)
-            retVals = wcutils.clientWebpipeCmd(self.webpipes, getFileCmd)
+            getFileCmd = projUtils.getFileReqStruct(filename)
+            retVals = projUtils.clientSendCmd(self.commPipes, getFileCmd)
             data = retVals.data
         return data
 
@@ -47,8 +48,8 @@ class FileInterface:
                 with open(filename, 'rb') as fp:
                     data = fp.read()
         else:
-            getNewestFileCmd = wcutils.getNewestFileReqStruct(filePattern)
-            retVals = wcutils.clientWebpipeCmd(self.webpipes, getNewestFileCmd)
+            getNewestFileCmd = projUtils.getNewestFileReqStruct(filePattern)
+            retVals = projUtils.clientSendCmd(self.commPipes, getNewestFileCmd)
             data = retVals.data
         return data
 
@@ -56,8 +57,8 @@ class FileInterface:
         if self.local:
             self.fileWatcher.initFileNotifier(dir, filePattern, minFileSize, demoStep)
         else:
-            initWatchCmd = wcutils.initWatchReqStruct(dir, filePattern, minFileSize, demoStep)
-            wcutils.clientWebpipeCmd(self.webpipes, initWatchCmd)
+            initWatchCmd = projUtils.initWatchReqStruct(dir, filePattern, minFileSize, demoStep)
+            projUtils.clientSendCmd(self.commPipes, initWatchCmd)
         self.initWatchSet = True
         return
 
@@ -73,8 +74,8 @@ class FileInterface:
                 with open(filename, 'rb') as fp:
                     data = fp.read()
         else:
-            watchCmd = wcutils.watchFileReqStruct(filename, timeout=timeout)
-            retVals = wcutils.clientWebpipeCmd(self.webpipes, watchCmd)
+            watchCmd = projUtils.watchFileReqStruct(filename, timeout=timeout)
+            retVals = projUtils.clientSendCmd(self.commPipes, watchCmd)
             data = retVals.data
         return data
 
@@ -86,8 +87,8 @@ class FileInterface:
             with open(filename, 'w+') as textFile:
                 textFile.write(text)
         else:
-            putFileCmd = wcutils.putTextFileReqStruct(filename, text)
-            wcutils.clientWebpipeCmd(self.webpipes, putFileCmd)
+            putFileCmd = projUtils.putTextFileReqStruct(filename, text)
+            projUtils.clientSendCmd(self.commPipes, putFileCmd)
         return
 
     def putBinaryFile(self, filename, data, compress=False):
@@ -100,16 +101,47 @@ class FileInterface:
         else:
             try:
                 fileHash = None
-                putFileCmd = wcutils.putBinaryFileReqStruct(filename)
-                for putFilePart in wcutils.generateDataParts(data, putFileCmd, compress):
+                putFileCmd = projUtils.putBinaryFileReqStruct(filename)
+                for putFilePart in projUtils.generateDataParts(data, putFileCmd, compress):
                     fileHash = putFilePart.get('fileHash')
-                    wcutils.clientWebpipeCmd(self.webpipes, putFilePart)
-            except Exception:
+                    projUtils.clientSendCmd(self.commPipes, putFilePart)
+            except Exception as err:
                 # Send error notice to clear any partially cached data on the server side
                 # Add fileHash to message and send status=400 to notify
                 if fileHash:
                     putFileCmd['fileHash'] = fileHash
                     putFileCmd['status'] = 400
-                    wcutils.clientWebpipeCmd(self.webpipes, putFileCmd)
-
+                    projUtils.clientSendCmd(self.commPipes, putFileCmd)
+                raise err
         return
+
+    def listFiles(self, filePattern):
+        if self.local:
+            if not os.path.isabs(filePattern):
+                errStr = "listFiles must have an absolute path: {}".format(filePattern)
+                raise RequestError(errStr)
+            fileList = []
+            for filename in glob.iglob(filePattern, recursive=True):
+                if os.path.isdir(filename):
+                    continue
+                fileList.append(filename)
+        else:
+            listCmd = projUtils.listFilesReqStruct(filePattern)
+            retVals = projUtils.clientSendCmd(self.commPipes, listCmd)
+            fileList = retVals.get('fileList')
+            if type(fileList) is not list:
+                errStr = "Invalid fileList reponse type {}: expecting list".format(type(fileList))
+                raise StateError(errStr)
+        return fileList
+
+    def allowedFileTypes(self):
+        if self.local:
+            return ['*']
+        else:
+            cmd = projUtils.allowedFileTypesReqStruct()
+            retVals = projUtils.clientSendCmd(self.commPipes, cmd)
+            fileTypes = retVals.get('fileTypes')
+            if type(fileTypes) is not list:
+                errStr = "Invalid fileTypes reponse type {}: expecting list".format(type(fileTypes))
+                raise StateError(errStr)
+        return fileTypes
